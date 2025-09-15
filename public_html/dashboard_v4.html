@@ -1,0 +1,453 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8"/>
+  <title>Dashboard (50m Grid + GPS + Heading + Video)</title>
+  <style>
+    html, body { margin:0; height:100%; }
+    body { display:flex; font-family: system-ui, Arial, sans-serif; }
+    #map { flex:2; }
+    /* 오른쪽 패널: 3:3:4 비율 */
+    #side {
+      flex:1; display:grid; grid-template-rows: 3fr 3fr 4fr;
+      border-left:1px solid #ddd; height:100%;
+      min-width: 380px;
+    }
+    /* 각 섹션 공통 */
+    .panel { padding:12px; min-height:0; display:flex; flex-direction:column; }
+    .panel h2 { margin:0 0 8px 0; font-size:16px; }
+    .scroll {
+      flex:1; overflow:auto; border:1px solid #eee; border-radius:8px;
+      background:#fafafa; padding:8px;
+    }
+    .card { border:1px solid #eee; border-radius:8px; padding:10px; margin-bottom:8px; background:#fff; cursor:pointer; }
+    .card button { cursor:pointer; }
+    .badge { display:inline-block; padding:2px 6px; border-radius:6px; background:#eee; margin-right:6px; font-size:12px; }
+
+    /* 채팅 UI */
+    #chat { border-top:1px solid #eee; }
+    #chat-log { display:flex; flex-direction:column; gap:8px; }
+    #chat-box { display:flex; gap:8px; margin-top:8px; }
+    #chat-input { flex:1; padding:8px; }
+    #send-btn { padding:8px 12px; }
+
+    .bubble-user {
+      align-self: flex-end; background:#1976D2; color:white;
+      padding:8px 12px; border-radius:16px 16px 0 16px;
+      max-width:70%; word-break:break-word;
+    }
+    .bubble-bot {
+      align-self: flex-start; background:#E0E0E0; color:black;
+      padding:8px 12px; border-radius:16px 16px 16px 0;
+      max-width:70%; word-break:break-word;
+    }
+    .bubble-mission {
+      align-self: center; background:#FFF3E0; color:#5D4037;
+      padding:10px 12px; border-radius:12px; border:1px solid #FFE0B2;
+      max-width:80%; word-break:break-word;
+    }
+    .mission-row { display:flex; align-items:center; gap:8px; flex-wrap:wrap; margin-top:6px; }
+    .mission-row button { padding:6px 10px; }
+
+    /* 비디오 모달 */
+    .modal { display:none; position:fixed; z-index:9999; left:0; top:0; width:100%; height:100%; background:rgba(0,0,0,0.5); }
+    .modal-content { position:absolute; top:50%; left:50%; transform:translate(-50%,-50%); background:#fff; padding:12px; border-radius:8px; width:800px; max-width:95%; }
+    .modal-header { display:flex; justify-content:space-between; align-items:center; margin-bottom:8px; }
+    .modal-body { max-height:70vh; overflow:auto; }
+  </style>
+</head>
+<body>
+  <div id="map"></div>
+
+  <div id="side">
+    <!-- 1) 최근 수질 (3) -->
+    <div id="wq" class="panel">
+      <h2>최근 수질</h2>
+      <div id="wq-list" class="scroll"></div>
+    </div>
+
+    <!-- 2) 드론 상태 (3) -->
+    <div id="drones" class="panel">
+      <h2>드론 상태</h2>
+      <div id="drone-list" class="scroll"></div>
+    </div>
+
+    <!-- 3) 임무 채팅 (4) -->
+    <div id="chat" class="panel">
+      <h2>임무 채팅</h2>
+      <div id="chat-log" class="scroll"></div>
+      <div id="chat-box">
+        <input id="chat-input" type="text" placeholder="메시지를 입력하세요..."/>
+        <button id="send-btn" type="button">전송</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- 영상 모달 -->
+  <div id="videoModal" class="modal" onclick="hideVideo()">
+    <div class="modal-content" onclick="event.stopPropagation()">
+      <div class="modal-header">
+        <div id="videoTitle"><b>드론 영상</b></div>
+        <button onclick="hideVideo()">닫기</button>
+      </div>
+      <div class="modal-body">
+        <img id="videoStream" src="" style="width:100%; height:auto;"/>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    let map, gridRecs = [], droneMarkers = new Map(), sending = false;
+
+    function ragColor(chla){
+      // BLUE(관심), YELLOW(주의), ORANGE(경계), RED(심각)
+      if(chla < 10) return '#64B5F6';     // BLUE
+      if(chla < 20) return '#FFF176';     // YELLOW
+      if(chla < 30) return '#FFB74D';     // ORANGE
+      return '#E57373';                   // RED
+    }
+
+    function wamisGrade(sample){
+      // 7등급 색/라벨 정의
+      const levels = [
+        {label:"매우좋음",   color:"#2196F3"}, // 1 매우좋음  BLUE
+        {label:"좋음",color:"#03A9F4"}, // 2 좋음   SKYBLUE
+        {label:"약간좋음",  color:"#4CAF50"}, // 3 약간좋음   GREEN
+        {label:"보통", color:"#FFEB3B"}, // 4 보통   YELLOW
+        {label:"약간나쁨", color:"#FF9800"}, // 5 약간나쁨   ORANGE
+        {label:"나쁨",    color:"#F44336"}, // 6 나쁨     RED
+        {label:"매우나쁨", color:"#9C27B0"}  // 7 매우나쁨   PURPLE
+      ];
+    
+      // 안전한 값 처리
+      const has = (v) => v !== undefined && v !== null && !isNaN(v);
+    
+      // 1) DO (용존산소량, mg/L) — 높을수록 좋음
+      if(has(sample.do_mg_l)){
+        const v = sample.do_mg_l;
+        if(v >= 7.5) return {...levels[0], idx:1, crit:`DO ${v}`};
+        if(v >= 5.0) return {...levels[1], idx:2, crit:`DO ${v}`};
+        if(v >= 3.0) return {...levels[2], idx:3, crit:`DO ${v}`};
+        if(v >= 2.0) return {...levels[3], idx:4, crit:`DO ${v}`};
+        if(v >= 1.0) return {...levels[4], idx:5, crit:`DO ${v}`};
+        if(v >= 0.5) return {...levels[5], idx:6, crit:`DO ${v}`};
+        return {...levels[6], idx:7, crit:`DO ${v}`};
+      }
+    
+      // 2) COD (mg/L) — 낮을수록 좋음
+      if(has(sample.cod_mg_l)){
+        const v = sample.cod_mg_l;
+        if(v <= 3) return {...levels[0], idx:1, crit:`COD ${v}`};
+        if(v <= 5) return {...levels[1], idx:2, crit:`COD ${v}`};
+        if(v <= 8) return {...levels[2], idx:3, crit:`COD ${v}`};
+        if(v <= 10) return {...levels[3], idx:4, crit:`COD ${v}`};
+        if(v <= 15) return {...levels[4], idx:5, crit:`COD ${v}`};
+        if(v <= 25) return {...levels[5], idx:6, crit:`COD ${v}`};
+        return {...levels[6], idx:7, crit:`COD ${v}`};
+      }
+    
+      // 3) pH — 6.5~8.5가 좋음, 범위 벗어나면 점점 나쁨
+      if(has(sample.ph)){
+        const v = sample.ph;
+        if(v >= 6.5 && v <= 8.5) return {...levels[0], idx:1, crit:`pH ${v}`};
+        if(v >= 6.0 && v <= 9.0) return {...levels[2], idx:3, crit:`pH ${v}`};
+        if(v >= 5.5 && v <= 9.5) return {...levels[4], idx:5, crit:`pH ${v}`};
+        return {...levels[6], idx:7, crit:`pH ${v}`};
+      }
+    
+      // 4) BOD (mg/L) — 낮을수록 좋음
+      if(has(sample.bod_mg_l)){
+        const v = sample.bod_mg_l;
+        if(v <= 1) return {...levels[0], idx:1, crit:`BOD ${v}`};
+        if(v <= 3) return {...levels[1], idx:2, crit:`BOD ${v}`};
+        if(v <= 5) return {...levels[2], idx:3, crit:`BOD ${v}`};
+        if(v <= 8) return {...levels[3], idx:4, crit:`BOD ${v}`};
+        if(v <= 10) return {...levels[4], idx:5, crit:`BOD ${v}`};
+        if(v <= 15) return {...levels[5], idx:6, crit:`BOD ${v}`};
+        return {...levels[6], idx:7, crit:`BOD ${v}`};
+      }
+    
+      // 5) SS (mg/L, 부유물질/탁도) — 낮을수록 좋음
+      if(has(sample.ss_mg_l)){
+        const v = sample.ss_mg_l;
+        if(v <= 5) return {...levels[0], idx:1, crit:`SS ${v}`};
+        if(v <= 15) return {...levels[1], idx:2, crit:`SS ${v}`};
+        if(v <= 25) return {...levels[2], idx:3, crit:`SS ${v}`};
+        if(v <= 50) return {...levels[3], idx:4, crit:`SS ${v}`};
+        if(v <= 100) return {...levels[4], idx:5, crit:`SS ${v}`};
+        if(v <= 200) return {...levels[5], idx:6, crit:`SS ${v}`};
+        return {...levels[6], idx:7, crit:`SS ${v}`};
+      }
+    
+      // fallback
+      return {...levels[6], idx:7, crit:"데이터 없음"};
+    }
+    
+
+    function arrowIcon(headingDeg){
+      // heading: 0=북, 시계방향 / Symbol 0deg=동 → 회전 보정 -90
+      const rotation = (headingDeg ?? 0) - 90;
+      return {
+        path: google.maps.SymbolPath.FORWARD_CLOSED_ARROW,
+        scale: 4,
+        rotation: rotation,
+        fillColor: '#1976D2', fillOpacity: 1,
+        strokeColor: '#ffffff', strokeWeight: 1
+      };
+    }
+
+    // ...기존 코드 상단 유틸 근처에 추가
+    async function getTileCentroid(zone_id){
+        try{
+          // 웹서버 프록시 처리함 http://211.43.213.175:8580
+        const res = await fetch('/api/tiles/centroid?zone_id=${encodeURIComponent(zone_id)}');
+        if(!res.ok) throw new Error("centroid api error");
+        const js = await res.json();
+        return {lat: js.lat, lon: js.lon};
+        }catch(e){
+        // 백엔드 API가 아직 없거나 에러면, 지도상의 polygon에서 대략 중심 추정 (fallback)
+        const rec = gridRecs.find(r => r.zone_id === zone_id);
+        if(rec){
+            const path = rec.poly.getPath().getArray();
+            const cx = path.reduce((s,p)=>s+p.lat(),0)/path.length;
+            const cy = path.reduce((s,p)=>s+p.lng(),0)/path.length;
+            return {lat: cx, lon: cy};
+        }
+        return {lat: null, lon: null};
+        }
+    }
+    function fmtCoord(v, d=6){ return (v===null||v===undefined||isNaN(v)) ? "-" : Number(v).toFixed(d); }
+
+    async function initMap(){
+      map = new google.maps.Map(document.getElementById('map'), {
+        center: {lat: 37.3804191, lng: 127.0028335}, zoom: 15
+      });
+      await drawGrid();
+      refreshWQ();   setInterval(refreshWQ,   10000);
+      refreshDrones(); setInterval(refreshDrones, 30000);
+    }
+
+    function clearGrid(){
+      gridRecs.forEach(r => { r.poly.setMap(null); r.overlay.setMap(null); });
+      gridRecs = [];
+    }
+
+    async function drawGrid(){
+      clearGrid();
+      // 웹서버 프록시 처리함 http://211.43.213.175:8580
+      const res = await fetch('/api/tiles');
+      const js = await res.json();
+      if(!js.ok){ alert('타일 조회 에러'); return; }
+
+      for(const f of js.features){
+        const path = f.geometry.coordinates[0].map(([lng,lat])=>({lat, lng}));
+        const poly = new google.maps.Polygon({
+          paths: [path],
+          strokeColor: '#546E7A', strokeOpacity: 0.8, strokeWeight: 1,
+          fillColor: '#ECEFF1', fillOpacity: 0.15
+        });
+        poly.setMap(map);
+
+        // 좌상단 라벨 (lat 최대 & lng 최소)
+        let corner = path.reduce((best, p) => {
+          if (!best) return p;
+          if (p.lat > best.lat || (p.lat === best.lat && p.lng < best.lng)) return p;
+          return best;
+        }, null);
+
+        const labelDiv = document.createElement("div");
+        labelDiv.style.position = "absolute";
+        labelDiv.style.color = "black";
+        labelDiv.style.fontSize = "10px";
+        labelDiv.style.background = "rgba(255,255,255,0.7)";
+        labelDiv.style.padding = "1px 2px";
+        labelDiv.style.borderRadius = "4px";
+        labelDiv.innerText = f.properties.zone_id;
+
+        const overlay = new google.maps.OverlayView();
+        overlay.onAdd = function(){
+          this.getPanes().overlayLayer.appendChild(labelDiv);
+        };
+        overlay.draw = function(){
+          const proj = this.getProjection();
+          const pos = proj.fromLatLngToDivPixel(new google.maps.LatLng(corner.lat, corner.lng));
+          labelDiv.style.left = pos.x + "px";
+          labelDiv.style.top  = pos.y + "px";
+        };
+        overlay.onRemove = function(){ if(labelDiv.parentNode) labelDiv.parentNode.removeChild(labelDiv); };
+        overlay.setMap(map);
+
+        gridRecs.push({zone_id: f.properties.zone_id, poly, overlay, chla: null});
+      }
+    }
+
+    function safe(val, digits=1){
+        return (val !== undefined && val !== null && !isNaN(val)) 
+            ? Number(val).toFixed(digits) 
+            : "-";
+    }
+
+    // ---------- 최근 수질 ----------
+    async function refreshWQ(){
+      // 웹서버 프록시 처리함 http://211.43.213.175:8580
+      const res = await fetch('/api/samples/latest'); 
+      const js = await res.json();
+      const list = document.getElementById('wq-list');
+      list.innerHTML = '';
+      const latestMap = new Map();
+      for(const s of js.items){ latestMap.set(s.zone_id, s); }
+
+      for(const r of gridRecs){
+        const s = js.items.find(x => x.zone_id === r.zone_id);
+        if(s){
+          const grade = wamisGrade(s);
+          r.poly.setOptions({fillColor: grade.color, fillOpacity: 0.5});
+          const row = document.createElement('div');
+          row.className='card';
+          row.innerHTML = `
+            <div>
+              <span class="badge" style="background:${grade.color};color:#000">${grade.label}</span>
+              <b>${r.zone_id}</b> — ${grade.crit}
+            </div>`;
+          row.addEventListener('click', () => createMissionBubble(r.zone_id, s));
+          list.appendChild(row);
+        }
+      }
+      
+    }
+
+    // ---------- 드론 ----------
+    async function refreshDrones(){
+      // 웹서버 프록시 처리함 http://211.43.213.175:8580
+      const res = await fetch('/api/drones'); 
+      const js = await res.json();
+      const cont = document.getElementById('drone-list');
+      cont.innerHTML = '';
+
+      const seen = new Set();
+      for(const [id, d] of Object.entries(js.drones)){
+        seen.add(id);
+        const div = document.createElement('div');
+        div.className = 'card';
+        const lat = d.lat?.toFixed ? d.lat.toFixed(6) : d.lat;
+        const lon = d.lon?.toFixed ? d.lon.toFixed(6) : d.lon;
+        const hdg = (d.heading ?? '-');
+        div.innerHTML = `<b>${id}</b><br/>
+          상태: ${d.status || 'IDLE'} / 배터리: ${d.battery ?? '-'}%<br/>
+          위치: ${lat ?? '-'}, ${lon ?? '-'} / 타일: ${d.zone_id ?? '-'} / 방위: ${hdg}°<br/>
+          <button ${d.video_url ? '' : 'disabled'} onclick="openVideo('${id}', '${d.video_url || ''}')">영상 보기</button>`;
+        cont.appendChild(div);
+
+        if(d.lat && d.lon){
+          let m = droneMarkers.get(id);
+          if(!m){
+            m = new google.maps.Marker({
+              position: {lat: d.lat, lng: d.lon},
+              map, title: id, icon: arrowIcon(d.heading)
+            });
+            droneMarkers.set(id, m);
+          }else{
+            m.setPosition({lat: d.lat, lng: d.lon});
+            m.setIcon(arrowIcon(d.heading));
+          }
+        }
+      }
+      // stale marker 제거
+      for(const [id, m] of droneMarkers.entries()){
+        if(!seen.has(id)){ m.setMap(null); droneMarkers.delete(id); }
+      }
+    }
+
+    // ---------- 임무 채팅 ----------
+    function appendBubble(text, cls){
+      const log = document.getElementById('chat-log');
+      const div = document.createElement('div');
+      div.className = cls; div.innerHTML = text;
+      log.appendChild(div);
+      log.scrollTop = log.scrollHeight;
+      return div;
+    }
+
+    // function createMissionBubble(zone_id, s){
+    //   // 최근수질 클릭 시: 임무 생성 카드(버블) 추가
+    //   const info = `타일 ${zone_id} ｜ Chl-a ${safe(s.chl_a_mg_m3)}, DO ${safe(s.do_mg_l)}, pH ${safe(s.ph)}, Turb ${safe(s.turb)}`;
+    //   const html = `
+    //     <div><b>임무</b> — ${info}</div>
+    //     <div class="mission-row">
+    //       <button type="button" onclick="startMission('${zone_id}')">생성</button>
+    //     </div>
+    //   `;
+    //   appendBubble(html, 'bubble-mission');
+    // }
+    async function createMissionBubble(zone_id, s){
+        const center = await getTileCentroid(zone_id); // {lat, lon}
+        // const info = `타일 ${zone_id} ｜ Chl-a ${safe(s.chl_a_mg_m3)}, DO ${safe(s.do_mg_l)}, pH ${safe(s.ph)}, Turb ${safe(s.turb)}`;        
+        const coord = `GPS: ${fmtCoord(center.lat)}, ${fmtCoord(center.lon)}`;
+        const info = `pH ${s.ph}, DO ${s.do_mg_l}, BOD ${s.bod_mg_l}, COD ${s.cod_mg_l}, T-N ${s.t_n_mg_l}, T-P ${s.t_p_mg_l}, Chl-a ${s.chl_a_mg_m3}`;
+        
+        const html = `
+            <div><b>임무</b> — ${info}</div>
+            <div style="margin-top:4px; font-size:12px; color:#555;">${coord}</div>
+            <div class="mission-row">
+            <button type="button" onclick="startMission('${zone_id}')">생성</button>
+            <button type="button" onclick="map.panTo({lat:${center.lat || 'null'}, lng:${center.lon || 'null'}})">지도이동</button>
+            <button type="button" onclick="navigator.clipboard?.writeText('${zone_id} ${fmtCoord(center.lat)} ${fmtCoord(center.lon)}')">좌표복사</button>
+            </div>
+        `;
+        appendBubble(html, 'bubble-mission');
+    }
+
+    function startMission(zone_id){
+      // 임무생성 대화 시작(예시): 운영자 확인용 초기 프롬프트
+      const botMsg = `임무생성을 시작합니다. 타겟 타일: ${zone_id}. 목표(예: 조류 저감/spray, 순찰/patrol, 시료채취/sample)와 지속시간/제한조건을 입력해 주세요.`;
+      appendBubble(botMsg, 'bubble-bot');
+    }
+
+    async function sendChat(){
+      if (sending) return;
+      const input = document.getElementById('chat-input');
+      const text = input.value.trim();
+      if (!text) return;
+
+      sending = true;
+      appendBubble(text, 'bubble-user');
+      input.value = '';
+
+      try {
+        // 웹서버 프록시 처리함 http://211.43.213.175:8580
+        const res = await fetch('/api/missions/chat', {
+          method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({text})
+        });
+        const js = await res.json();
+        appendBubble(js.echo ?? '응답 수신', 'bubble-bot');
+      } catch (e) {
+        appendBubble('전송 오류가 발생했습니다.', 'bubble-bot');
+        console.error(e);
+      } finally {
+        sending = false;
+      }
+    }
+
+    document.getElementById('chat-input').addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' && !e.isComposing) {
+        e.preventDefault();
+        sendChat();
+      }
+    });
+    document.getElementById('send-btn').addEventListener('click', sendChat);
+
+    // ---------- 비디오 ----------
+    function openVideo(droneId, url){
+      if(!url){ alert('영상 URL이 없습니다.'); return; }
+      document.getElementById('videoTitle').innerText = `드론 영상 — ${droneId}`;
+      document.getElementById('videoStream').src = url;
+      document.getElementById('videoModal').style.display = 'block';
+    }
+    function hideVideo(){
+      document.getElementById('videoStream').src = '';
+      document.getElementById('videoModal').style.display = 'none';
+    }
+  </script>
+  <script async src="https://maps.googleapis.com/maps/api/js?key=AIzaSyBMWbW9XsmST7vLjFZcGo6jp2rMR_VwvzE&callback=initMap"></script>
+</body>
+</html>

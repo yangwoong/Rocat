@@ -1,0 +1,313 @@
+
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8"/>
+  <title>Dashboard (50m Grid + GPS + Video)</title>
+  <style>
+    html, body { margin:0; height:100%; }
+    body { display:flex; font-family: system-ui, Arial, sans-serif; }
+    #map { flex:2; }
+    #side { flex:1; display:flex; flex-direction:column; border-left:1px solid #ddd; }
+    #wq { flex:1; padding:12px; overflow:auto; }
+    #chat { flex:1; display:flex; flex-direction:column; border-top:1px solid #eee; padding:12px; }
+    #chat-log { flex:1; overflow:auto; border:1px solid #eee; padding:8px; }
+    #chat-box { display:flex; gap:8px; margin-top:8px; }
+    #drones { flex:1; padding:12px; border-top:1px solid #eee; overflow:auto; }
+    input[type=text] { flex:1; padding:8px; }
+    button { padding:8px 12px; }
+    .card { border:1px solid #eee; border-radius:8px; padding:10px; margin-bottom:8px; }
+    .badge { display:inline-block; padding:2px 6px; border-radius:6px; background:#eee; margin-right:6px; }
+    .modal { display:none; position:fixed; z-index:9999; left:0; top:0; width:100%; height:100%; background:rgba(0,0,0,0.5); }
+    .modal-content { position:absolute; top:50%; left:50%; transform:translate(-50%,-50%); background:#fff; padding:12px; border-radius:8px; width:800px; max-width:95%; }
+    .modal-header { display:flex; justify-content:space-between; align-items:center; margin-bottom:8px; }
+    .modal-body { max-height:70vh; overflow:auto; }
+
+    /* 사이드 패널을 3등분: 최근수질 / 드론상태 / 채팅 */
+    #side { display: grid; grid-template-rows: 1fr 1fr minmax(260px, 1fr); height: 100%; }
+
+    /* 채팅: 내부 레이아웃 고정 & 스크롤은 로그에서만 */
+    #chat { display:flex; flex-direction:column; border-top:1px solid #eee; padding:12px; min-height:0; }
+    #chat-log { flex:1; overflow:auto; padding:8px; display:flex; flex-direction:column; gap:8px; border:1px solid #eee; border-radius:8px; background:#fafafa; }
+    #chat-box { display:flex; gap:8px; margin-top:8px; }
+    #chat-input { flex:1; padding:8px; }
+    #send-btn { padding:8px 12px; }
+
+    /* 말풍선 */
+    .bubble-user {
+      align-self: flex-end;
+      background:#1976D2; color:white;
+      padding:8px 12px; border-radius:16px 16px 0 16px;
+      max-width:70%; word-break:break-word;
+    }
+    .bubble-bot {
+      align-self: flex-start;
+      background:#E0E0E0; color:black;
+      padding:8px 12px; border-radius:16px 16px 16px 0;
+      max-width:70%; word-break:break-word;
+    }
+
+
+  </style>
+</head>
+<body>
+  <div id="map"></div>
+
+  <div id="side">
+    <div id="wq">
+      <h2>최근 수질</h2>
+      <div id="wq-list"></div>
+    </div>
+
+    <div id="drones">
+      <h2>드론 상태</h2>
+      <div id="drone-list"></div>
+    </div>
+
+    <div id="chat">
+      <h2>임무 채팅</h2>
+      <!-- 스크롤되는 리스트 영역 -->
+      <div id="chat-log" class="chat-list"></div>
+      <!-- 입력창 + 버튼 (form 아님: 엔터 제출로 인한 중복 방지) -->
+      <div id="chat-box">
+        <input id="chat-input" type="text" placeholder="메시지를 입력하세요..."/>
+        <button id="send-btn" type="button">전송</button>
+      </div>
+    </div>
+  </div>
+
+
+
+  <div id="videoModal" class="modal" onclick="closeVideo(event)">
+    <div class="modal-content" onclick="event.stopPropagation()">
+      <div class="modal-header">
+        <div id="videoTitle"><b>드론 영상</b></div>
+        <button onclick="hideVideo()">닫기</button>
+      </div>
+      <div class="modal-body">
+        <img id="videoStream" src="" style="width:100%; height:auto;"/>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    let map, gridRecs = [], droneMarkers = new Map();
+
+    async function initMap(){
+      map = new google.maps.Map(document.getElementById('map'), {
+        center: {lat: 37.3804191, lng: 127.0028335}, zoom: 15
+      });
+      await drawGrid();
+      refreshWQ(); setInterval(refreshWQ, 30000);
+      refreshDrones(); setInterval(refreshDrones, 10000);
+    }
+
+    function clearGrid(){
+      gridRecs.forEach(r => { r.poly.setMap(null); r.overlay.setMap(null); });
+      gridRecs = [];
+    }
+
+    function ragColor(chla){
+      if(chla < 10) return '#64B5F6';     // BLUE 관심
+      if(chla < 20) return '#FFF176';     // YELLOW 주의
+      if(chla < 30) return '#FFB74D';     // ORANGE 경계
+      return '#E57373';                   // RED 심각
+    }
+
+    async function drawGrid(){
+      clearGrid();
+      const res = await fetch('http://211.43.213.175:8580/api/tiles');
+      const js = await res.json();
+      if(!js.ok){ alert('타일 조회 에러'); return; }
+
+      for(const f of js.features){
+        const path = f.geometry.coordinates[0].map(([lng,lat])=>({lat, lng}));
+        const poly = new google.maps.Polygon({
+          paths: [path],
+          strokeColor: '#546E7A', strokeOpacity: 0.8, strokeWeight: 1,
+          fillColor: '#ECEFF1', fillOpacity: 0.15
+        });
+        poly.setMap(map);
+
+        // 좌상단 코너 (lat 최대 & lng 최소)
+        let corner = path.reduce((best, p) => {
+          if (!best) return p;
+          if (p.lat > best.lat || (p.lat === best.lat && p.lng < best.lng)) return p;
+          return best;
+        }, null);
+
+        // 라벨
+        const labelDiv = document.createElement("div");
+        labelDiv.style.position = "absolute";
+        labelDiv.style.color = "black";
+        labelDiv.style.fontSize = "10px";
+        labelDiv.style.background = "rgba(255,255,255,0.7)";
+        labelDiv.style.padding = "1px 2px";
+        labelDiv.style.borderRadius = "4px";
+        labelDiv.innerText = f.properties.zone_id;
+
+        const overlay = new google.maps.OverlayView();
+        overlay.onAdd = function(){
+          const layer = this.getPanes().overlayLayer;
+          layer.appendChild(labelDiv);
+        };
+        overlay.draw = function(){
+          const proj = this.getProjection();
+          const pos = proj.fromLatLngToDivPixel(new google.maps.LatLng(corner.lat, corner.lng));
+          labelDiv.style.left = pos.x + "px";
+          labelDiv.style.top = pos.y + "px";
+        };
+        overlay.onRemove = function(){ if(labelDiv.parentNode) labelDiv.parentNode.removeChild(labelDiv); };
+        overlay.setMap(map);
+
+        gridRecs.push({zone_id: f.properties.zone_id, poly, overlay, chla: null});
+      }
+    }
+
+    async function refreshWQ(){
+      const res = await fetch('http://211.43.213.175:8580/api/samples/latest'); 
+      const js = await res.json();
+      const list = document.getElementById('wq-list');
+      list.innerHTML = '';
+      const latestMap = new Map();
+      for(const s of js.items){ latestMap.set(s.zone_id, s); }
+
+      for(const r of gridRecs){
+        const s = latestMap.get(r.zone_id);
+        if(s){
+          r.chl_a_mg_m3 = s.chl_a_mg_m3;
+          r.poly.setOptions({fillColor: ragColor(s.chl_a_mg_m3), fillOpacity: 0.5});
+          let badge = "BLUE";
+          if(s.chl_a_mg_m3 < 10) badge = "BLUE";
+          else if(s.chl_a_mg_m3 < 20) badge = "YELLOW";
+          else if(s.chl_a_mg_m3 < 30) badge = "ORANGE";
+          else badge = "RED";
+          const row = document.createElement('div');
+          row.className='card';
+          row.innerHTML = `<div><span class="badge">${badge}</span> <b>${r.zone_id}</b> — Chl-a ${s.chl_a_mg_m3.toFixed(1)}, DO ${s.do_mg_l.toFixed(1)}</div>`;
+          list.appendChild(row);
+        }
+      }
+    }
+
+    function markerIcon(color){
+      return {
+        path: google.maps.SymbolPath.CIRCLE,
+        scale: 6,
+        fillColor: color, fillOpacity: 1,
+        strokeColor: '#ffffff', strokeWeight: 1
+      };
+    }
+
+    async function refreshDrones(){
+      const res = await fetch('http://211.43.213.175:8580/api/drones'); 
+      const js = await res.json();
+      const cont = document.getElementById('drone-list');
+      cont.innerHTML = '';
+
+      const seen = new Set();
+      for(const [id, d] of Object.entries(js.drones)){
+        seen.add(id);
+        const div = document.createElement('div');
+        div.className = 'card';
+        const lat = d.lat?.toFixed ? d.lat.toFixed(6) : d.lat;
+        const lon = d.lon?.toFixed ? d.lon.toFixed(6) : d.lon;
+        div.innerHTML = `<b>${id}</b><br/>
+          상태: ${d.status || 'IDLE'} / 배터리: ${d.battery ?? '-'}%<br/>
+          위치: ${lat ?? '-'}, ${lon ?? '-'} / 타일: ${d.zone_id ?? '-'}<br/>
+          <button ${d.video_url ? '' : 'disabled'} onclick="openVideo('${id}', '${d.video_url || ''}')">영상 보기</button>`;
+        cont.appendChild(div);
+
+        if(d.lat && d.lon){
+          let m = droneMarkers.get(id);
+          if(!m){
+            m = new google.maps.Marker({
+              position: {lat: d.lat, lng: d.lon},
+              map,
+              title: id,
+              icon: markerIcon('#1976D2')
+            });
+            droneMarkers.set(id, m);
+          }else{
+            m.setPosition({lat: d.lat, lng: d.lon});
+          }
+        }
+      }
+      for(const [id, m] of droneMarkers.entries()){
+        if(!seen.has(id)){
+          m.setMap(null);
+          droneMarkers.delete(id);
+        }
+      }
+    }
+
+    // --- 중복 전송 방지용 플래그 (빠른 연타 보호)
+    let sending = false;
+
+    function appendBubble(text, cls){
+      const log = document.getElementById('chat-log');
+      const div = document.createElement('div');
+      div.className = cls; div.innerText = text;
+      log.appendChild(div);
+      log.scrollTop = log.scrollHeight; // 항상 최신 메시지 보이기
+    }
+
+    async function sendChat(){
+      if (sending) return;
+      const input = document.getElementById('chat-input');
+      const text = input.value.trim();
+      if (!text) return;
+
+      sending = true;
+      // 사용자 버블
+      appendBubble(text, 'bubble-user');
+      input.value = '';
+
+      try {
+        const res = await fetch('http://211.43.213.175:8580/api/missions/chat', {
+          method: 'POST',
+          headers: {'Content-Type':'application/json'},
+          body: JSON.stringify({text})
+        });
+        const js = await res.json();
+        // AI 응답 버블
+        appendBubble(js.echo ?? '응답 수신', 'bubble-bot');
+      } catch (e) {
+        appendBubble('전송 오류가 발생했습니다.', 'bubble-bot');
+        console.error(e);
+      } finally {
+        sending = false;
+      }
+    }
+
+    // 엔터로 전송 (IME 조합 중에는 무시)
+    const chatInput = document.getElementById('chat-input');
+    chatInput.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' && !e.isComposing) {
+        e.preventDefault(); // 줄바꿈/폼제출 방지
+        sendChat();
+      }
+    });
+
+    // 버튼으로 전송
+    document.getElementById('send-btn').addEventListener('click', sendChat);
+
+
+    function openVideo(droneId, url){
+      if(!url){
+        alert('이 드론에 등록된 영상 URL이 없습니다.');
+        return;
+      }
+      document.getElementById('videoTitle').innerText = `드론 영상 — ${droneId}`;
+      document.getElementById('videoStream').src = url;
+      document.getElementById('videoModal').style.display = 'block';
+    }
+    function hideVideo(){
+      document.getElementById('videoStream').src = '';
+      document.getElementById('videoModal').style.display = 'none';
+    }
+    function closeVideo(e){ hideVideo(); }
+  </script>
+  <script async src="https://maps.googleapis.com/maps/api/js?key=AIzaSyBMWbW9XsmST7vLjFZcGo6jp2rMR_VwvzE&callback=initMap"></script>
+</body>
+</html>

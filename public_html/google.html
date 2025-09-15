@@ -1,0 +1,89 @@
+
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8"/>
+  <title>Google Map - Boundary & 50m Tiles</title>
+  <style>
+    body { margin:0; display:flex; height:100vh; }
+    #left { flex: 2; }
+    #right { flex: 1; padding: 12px; border-left: 1px solid #ddd; overflow:auto; }
+    #map { width:100%; height:100%; }
+    textarea { width:100%; height:160px; }
+    button { margin: 6px 0; padding: 8px 12px; }
+    .badge { display:inline-block; padding:2px 6px; border-radius:6px; background:#eee; margin-right:6px; }
+  </style>
+</head>
+<body>
+  <div id="left"><div id="map"></div></div>
+  <div id="right">
+    <h2>경계 업로드</h2>
+    <p>GeoJSON(Feature/FeatureCollection/Geometry) 붙여넣기</p>
+    <textarea id="geojson"></textarea>
+    <button onclick="uploadBoundary()">경계 업로드</button>
+    <hr/>
+    <h2>타일 생성 (50m, DB 저장)</h2>
+    <button onclick="generateTiles()">타일 생성</button>
+    <div id="stats"></div>
+  </div>
+
+  <script>
+    let map, tilePolys = [];
+
+    function initMap(){
+      map = new google.maps.Map(document.getElementById('map'), {
+        center: {lat: 37.3804191, lng: 127.0028335},
+        zoom: 17
+      });
+      drawTiles(); // 이미 DB에 있으면 표시
+    }
+
+    function clearTiles(){
+      tilePolys.forEach(p => p.setMap(null));
+      tilePolys = [];
+    }
+
+    async function drawTiles(){
+      clearTiles();
+      // 웹서버 프록시 처리함 http://211.43.213.175:8580
+      const res = await fetch('/api/tiles');
+      const js = await res.json();
+      if(!js.ok){ alert('타일 조회 에러'); return; }
+      for(const f of js.features){
+        const path = f.geometry.coordinates[0].map(([lng,lat])=>({lat, lng}));
+        const poly = new google.maps.Polygon({
+          paths: [path],
+          strokeColor: '#009688', strokeOpacity: 0.9, strokeWeight: 1,
+          fillColor: '#80CBC4', fillOpacity: 0.2
+        });
+        poly.setMap(map);
+        tilePolys.push(poly);
+      }
+      document.getElementById('stats').innerHTML = '표시 타일: <span class="badge">'+tilePolys.length+'</span>';
+    }
+
+    async function uploadBoundary(){
+      try{
+        const gj = JSON.parse(document.getElementById('geojson').value);
+        // 웹서버 프록시 처리함 http://211.43.213.175:8580
+        const res = await fetch('/api/boundary/geojson', {
+          method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(gj)
+        });
+        const js = await res.json();
+        alert('업로드 완료: ' + JSON.stringify(js));
+      }catch(e){
+        alert('파싱/업로드 오류: ' + e.message);
+      }
+    }
+
+    async function generateTiles(){
+      // 웹서버 프록시 처리함 http://211.43.213.175:8580
+      const res = await fetch('/api/tiles/generate?tile_m=50', {method:'POST'});
+      const js = await res.json();
+      if(!js.ok){ alert('타일 생성 에러'); return; }
+      await drawTiles();
+    }
+  </script>
+  <script async src="https://maps.googleapis.com/maps/api/js?key=AIzaSyBMWbW9XsmST7vLjFZcGo6jp2rMR_VwvzE&callback=initMap"></script>
+</body>
+</html>
