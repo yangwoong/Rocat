@@ -1,0 +1,8 @@
+
+fastapi==0.112.0
+uvicorn[standard]
+psycopg2-binary==2.9.9
+shapely==2.0.4
+pyproj
+geojson==3.1.0
+python-multipart==0.0.9
