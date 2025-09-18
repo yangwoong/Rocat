@@ -1,0 +1,419 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8"/>
+  <title>Simulator (50m Grid)</title>
+  <style>
+    html, body { margin:0; height:100%; overflow-x: hidden;}
+    body { display:flex; font-family: system-ui, Arial, sans-serif; }
+    #map { flex:2; }
+    #side { flex:1; display:flex; flex-direction:column; border-left:1px solid #ddd; padding:12px; }
+    .row { margin-bottom:8px; }
+    .card { min-width: 0; }
+    input[type=number], input[type=text] { width:100%; padding:6px; }
+    button { padding:8px 12px; margin-right:6px; }
+    #log{
+      width: 100%;
+      height: 340px;
+      overflow-y: auto;     /* 세로 스크롤 */
+      overflow-x: auto;     /* 가로 스크롤(필요 시만) */
+      white-space: pre-wrap;/* 줄바꿈 문자 유지 + 자동 줄바꿈 허용 */
+      word-break: break-word;   /* 긴 단어/토큰도 줄바꿈 */
+      overflow-wrap: anywhere;  /* 아주 긴 토큰도 어디서든 줄바꿈 */
+      box-sizing: border-box;   /* padding 포함 폭 계산 */
+      max-width: 100%;          /* 부모 폭 넘지 않도록 */
+      background:#fafafa; 
+      padding:8px; 
+      border:1px solid #eee;
+    }
+    .selected { stroke: #D32F2F !important; fill: #ffcdd2 !important; }
+  </style>
+</head>
+<body>
+  <div id="map"></div>
+  <div id="side">
+    <h2>AI Roboat 💧수질 시뮬레이터💧</h2>
+    <div class="row"><b>선택 타일: <span id="sel-tile">-</span></b></div>
+    <div class="row"><label>수온</label><input id="temp_c" type="number" step="0.5" value="19.5"/></div>
+    <div class="row"><label>pH</label><input id="ph" type="number" step="0.1" value="7.4"/></div>
+    <div class="row"><label>ec</label><input id="ec_us_cm" type="number" step="1" value="230"/></div>
+    <div class="row"><label>do</label><input id="do_mg_l" type="number" step="0.1" value="7.2"/></div>
+    <div class="row"><label>toc</label><input id="toc_mg_l" type="number" step="0.1" value="2.7"/></div>
+    <div class="row"><label>cod</label><input id="cod_mg_l" type="number" step="0.1" value="10.6"/></div>
+    <div class="row"><label>t_n</label><input id="t_n_mg_l" type="number" step="0.1" value="1.289"/></div>
+    <div class="row"><label>t_p</label><input id="t_p_mg_l" type="number" step="0.1" value="0.028"/></div>
+    <div class="row"><label>ss</label><input id="ss_mg_l" type="number" step="0.1" value="5.6"/></div>
+    <div class="row"><label>cl</label><input id="cl_mg_l" type="number" step="0.1" value="5.6"/></div>
+    <div class="row"><label>chl_a</label><input id="chl_a_mg_m3" type="number" step="0.1" value="6.5"/></div>
+    <div class="row"><label>cd</label><input id="cd_mg_l" type="number" step="0.0001" value="0.0005"/></div>
+    <div class="row"><label>bod</label><input id="bod_mg_l" type="number" step="1" value="2"/></div>
+
+    <div class="row">
+      <button onclick="sendOnce()">한 번 전송</button>
+      <button onclick="toggleAuto()">자동 전송 On/Off</button>
+    </div>
+    <div id="log"></div>
+  </div>
+
+  <script>
+    let map, tilePolys = [], selected = null, autoTimer = null;
+
+    async function initMap(){
+      map = new google.maps.Map(document.getElementById('map'), {
+        center: {lat: 37.3804191, lng: 127.0028335}, zoom: 17
+      });
+      await drawTiles();
+    }
+
+    function clearTiles(){
+      tilePolys.forEach(p => p.poly.setMap(null));
+      tilePolys = [];
+      selected = null;
+      document.getElementById('sel-tile').innerText = '-';
+    }
+
+    async function drawTiles(){
+      clearTiles();
+      const res = await fetch('/api/tiles', {
+        headers:{'Content-Type':'application/json'}
+      });
+      const js = await res.json();
+      if(!js.ok){ alert('타일 조회 에러'); return; }
+      for(const f of js.features){
+        const path = f.geometry.coordinates[0].map(([lng,lat])=>({lat, lng}));
+        const poly = new google.maps.Polygon({
+          paths: [path],
+          strokeColor: '#3949AB', strokeOpacity: 0.9, strokeWeight: 1,
+          fillColor: '#9FA8DA', fillOpacity: 0.2
+        });
+        poly.setMap(map);
+        const rec = {zone_id: f.properties.zone_id, poly};
+        poly.addListener('click', ()=> selectTile(rec));
+        tilePolys.push(rec);
+      }
+    }
+
+    function selectTile(rec){
+      if(selected){ selected.poly.setOptions({strokeColor:'#3949AB', fillColor:'#9FA8DA'}); }
+      selected = rec;
+      selected.poly.setOptions({strokeColor:'#D32F2F', fillColor:'#ffcdd2'});
+      document.getElementById('sel-tile').innerText = rec.zone_id;
+    }
+
+    function log(msg){
+      const d = document.getElementById('log');
+      d.innerHTML += `<div>${new Date().toLocaleTimeString()} — ${msg}</div>`;
+      d.scrollTop = d.scrollHeight;
+    }
+
+    function j(v){ try{return JSON.stringify(v);}catch(_){return String(v);} }
+
+    function appendLLMLog(resp){
+      const refs = Array.isArray(resp.reference_sources) && resp.reference_sources.length
+        ? '참고문헌: ' + resp.reference_sources.map(x=>'• '+x).join('') : '';
+      
+        log(`[WQ-LLM 응답] zone: ${resp.zone_id ?? '-'}, device: ${resp.device_id ?? '-'}\n현재등급: ${resp.curr_wq_state ?? '-'} → 목표등급: ${resp.target_wq_state ?? '-'}\n이유: ${resp.reason ?? ''}\n${refs}`);
+    }
+
+    function analyzeTestRes(){
+      return {
+        water_q_idx: val('11'),
+        zone_id: val(selected.zone_id),
+        device_id: val(selected.zone_id),
+        curr_wq_state: val('IV'),
+        target_wq_state: val('III'),
+        reason: val('해당구역은 물의 흐름이 원할하여 보통(III)의 단계를 유지해야 하나 조류(Chl-a)가 증가하는 것으로 보아 물의 흐름이 정체되고 유입수가 없습니다.'),
+        reference_sources: val("/data/citicat/water_quality_docs/대규모수질오염대응매뉴얼.pdf"),
+      };
+    }
+
+    async function callLLM(llm_url, water_q_idx, zone_id, device_id, w_data){
+      const body = { water_q_idx, zone_id, device_id, w_data };
+      // log(`LLM 요청 → ${llm_url} :: ${j(body)}`);
+      const res = await fetch(llm_url, {
+        method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body: JSON.stringify(body)
+      });
+      const text = await res.text();
+      let obj = null;
+      try{
+        obj = JSON.parse(text);
+      }catch(_){
+        const m = text.match(/\{[\s\S]*\}/);
+        if(m){
+          try{ obj = JSON.parse(m[0]); }catch(__){}
+        }
+      }
+      if(!obj){
+        log(`LLM 응답 파싱 실패: ${text.slice(0,200)}...`);
+        throw new Error('LLM parse error');
+      }
+      // log(`LLM 응답 ← ${j(obj)}`);
+
+      return obj;
+    }
+
+    async function callLLM_Test(llm_url, water_q_idx, zone_id, device_id, w_data){
+      // Test
+      const test_analyze = analyzeTestRes();
+      // log(`LLM 응답 ← ${j(test_analyze)}`);
+      obj = JSON.stringify(test_analyze);
+
+      return obj;
+    }
+    
+    async function send(w_data){
+      try{
+        log(`AI에 수질판정 요청`);
+
+        // const llmResp = await callLLM_Test("/llm/api/water-quality/analyze", selected.zone_id, selected.zone_id, w_data);
+        const llmResp = await callLLM("/llm/api/water-quality/analyze", 30, selected.zone_id, 10, w_data);
+        // log(`LLM 응답 ← ${j(llmResp)}`);
+        appendLLMLog(llmResp);
+
+        saveWQToDB(selected.zone_id, 10, w_data, llmResp);
+        // const res = await fetch('/api/samples/ingest', {
+        //   method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(samples)
+        // });
+        // const js = await res.json();
+        // log('전송: '+js.count+'건');
+      }catch(e){
+        log('오류: ' + e.message);
+        console.error(e);
+      }finally{
+        // document.getElementById('btnSend').disabled = false;
+      }
+    }
+
+    function sendOnce(){
+      if(!selected){ alert('타일을 먼저 선택하세요'); return; }
+      const sample = {
+        // zone_id: selected.zone_id,
+        // device_id: selected.zone_id,
+        temp_c: parseFloat(document.getElementById('temp_c').value),
+        ph: parseFloat(document.getElementById('ph').value),
+        ec_us_cm: parseFloat(document.getElementById('ec_us_cm').value),
+        do_mg_l: parseFloat(document.getElementById('do_mg_l').value),
+        toc_mg_l: parseFloat(document.getElementById('toc_mg_l').value),
+        cod_mg_l: parseFloat(document.getElementById('cod_mg_l').value),
+        t_n_mg_l: parseFloat(document.getElementById('t_n_mg_l').value),
+        t_p_mg_l: parseFloat(document.getElementById('t_p_mg_l').value),
+        ss_mg_l: parseFloat(document.getElementById('ss_mg_l').value),
+        cl_mg_l: parseFloat(document.getElementById('cl_mg_l').value),
+        chl_a_mg_m3: parseFloat(document.getElementById('chl_a_mg_m3').value),
+        cd_mg_l: parseFloat(document.getElementById('cd_mg_l').value),
+        bod_mg_l: parseFloat(document.getElementById('bod_mg_l').value)
+      };
+      // log('sample:'+JSON.stringify(sample));
+      send(sample);
+    }
+
+
+    // 자동화
+    // --- 등급 정의 (Ia, Ib, II, III, IV, V, VI) ---
+    const LAKE_GRADES = ["Ia","Ib","II","III","IV","V","VI"];
+
+    // 호소수 기준(요약) → 범위를 "좋음→나쁨"으로 완만하게 확장
+    // 근거: pH, COD, SS, DO, T-P, T-N, Chl-a (호소수 기준 표) :contentReference[oaicite:3]{index=3}
+    const RANGES = {
+      // pH는 6.5~8.5 유지(경고 구간은 등급이 내려가도 동일 범위로 처리)
+      pH: {
+        "Ia":[6.6,8.3], "Ib":[6.6,8.4], "II":[6.5,8.5], "III":[6.5,8.5],
+        "IV":[6.4,8.6], "V":[6.3,8.7], "VI":[6.2,8.8]
+      },
+      // COD (mg/L): (≤2, ≤3, ≤4, ≤5, ≤8, ≤10, >10) → 각 등급의 상한 부근에서 난수
+      COD: {
+        "Ia":[0.8,2.0], "Ib":[1.0,3.0], "II":[2.0,4.0], "III":[3.0,5.0],
+        "IV":[4.0,8.0], "V":[6.0,10.0], "VI":[9.0,20.0]
+      },
+      // SS (mg/L): (≤1, ≤5, ≤5, ≤15, ≤25, ≤35, >35) 표(기관별 표기에 변동 존재) → 보수적 범위
+      SS: {
+        "Ia":[0,1], "Ib":[1,5], "II":[3,5], "III":[5,15],
+        "IV":[10,25], "V":[20,35], "VI":[35,100]
+      },
+      // DO (mg/L): (≥7.5, ≥5.0, ≥5.0, ≥5.0, ≥3.0, ≥2.0, <2.0) → 등급 하락 시 낮게
+      DO: {
+        "Ia":[7.8,9.5], "Ib":[5.5,8.5], "II":[5.2,7.5], "III":[5.0,7.0],
+        "IV":[3.0,5.5], "V":[2.0,4.0], "VI":[0.3,2.0]
+      },
+      // T-P (mg/L): (≤0.01, ≤0.02, ≤0.03, ≤0.05, ≤0.1, ≤0.2, >0.2)
+      TP: {
+        "Ia":[0.002,0.010], "Ib":[0.005,0.020], "II":[0.010,0.030],
+        "III":[0.020,0.050], "IV":[0.05,0.10], "V":[0.10,0.20], "VI":[0.20,0.50]
+      },
+      // T-N (mg/L): (≤0.2, ≤0.3, ≤0.4, ≤0.6, ≤1.0, ≤1.5, >1.5)  ※ 표는 기관별 표기 편차가 있으므로 보수 범위
+      TN: {
+        "Ia":[0.05,0.20], "Ib":[0.10,0.30], "II":[0.15,0.40],
+        "III":[0.30,0.60], "IV":[0.60,1.00], "V":[1.00,1.50], "VI":[1.50,3.00]
+      },
+      // Chl-a (mg/m3): (≤5, ≤9, ≤14, ≤20, ≤40, ≤60, >60)
+      CHLA: {
+        "Ia":[0.5,5], "Ib":[2,9], "II":[4,14], "III":[8,20],
+        "IV":[15,40], "V":[30,60], "VI":[60,120]
+      }
+    };
+
+    // 보조 항목(시뮬레이터용 합리적 범위) — 국내 자료 참고하여 설정
+    // TOC(호소수) 6이하가 일반적 목표치. :contentReference[oaicite:4]{index=4}
+    const EXTRA = {
+      TOC: {
+        "Ia":[1.0,3.0], "Ib":[1.5,4.0], "II":[2.0,5.0], "III":[3.0,6.0],
+        "IV":[4.0,8.0], "V":[5.0,10.0], "VI":[6.0,15.0]
+      },
+      // BOD — 호소는 COD를 주로 쓰지만, 시뮬레이터 요구에 맞춰 강하천 기준을 완만히 차용. :contentReference[oaicite:5]{index=5}
+      BOD: {
+        "Ia":[0.3,1.0], "Ib":[0.8,2.0], "II":[1.5,3.0], "III":[2.5,5.0],
+        "IV":[4.0,8.0], "V":[6.0,10.0], "VI":[10.0,20.0]
+      },
+      // 염소이온(Cl-) — 건강보호기준 250 mg/L 이하(지하수 기준표 참고) :contentReference[oaicite:6]{index=6}
+      CL: {
+        "Ia":[5,25], "Ib":[10,40], "II":[15,60], "III":[20,80],
+        "IV":[30,120], "V":[40,180], "VI":[50,250]
+      },
+      // 카드뮴(Cd) — 0.01 mg/L 이하를 매우 낮게 분포(안전측) :contentReference[oaicite:7]{index=7}
+      CD: {
+        "Ia":[0.00005,0.0003], "Ib":[0.0001,0.0005], "II":[0.0002,0.0010],
+        "III":[0.0003,0.0020], "IV":[0.0005,0.0050], "V":[0.001,0.008], "VI":[0.002,0.010]
+      },
+      // EC(μS/cm) — 담수 호소 일반 범위(저염~중염) 가정, 등급 하락 시 증가
+      EC: {
+        "Ia":[50,200], "Ib":[80,300], "II":[100,400], "III":[150,600],
+        "IV":[200,800], "V":[300,1200], "VI":[400,2000]
+      },
+      // 수온(°C) — 등급과 직접 기준은 없으나 계절형 분포. 단순 시뮬레이터용.
+      TEMP: {
+        "Ia":[10,22], "Ib":[12,24], "II":[14,26], "III":[16,28],
+        "IV":[18,30], "V":[20,32], "VI":[22,34]
+      }
+    };
+
+    // 유틸: 구간 난수
+    function randIn([a,b], digits=2){
+      const v = a + Math.random()*(b-a);
+      return Number(v.toFixed(digits));
+    }
+
+    // 등급별 랜덤 수질값 생성
+    function randomWQByGrade(grade){
+      const g = grade || LAKE_GRADES[Math.floor(Math.random()*LAKE_GRADES.length)];
+      const pH = randIn(RANGES.pH[g], 2);
+      const cod = randIn(RANGES.COD[g], 2);
+      const ss  = randIn(RANGES.SS[g], 0);
+      const dox = randIn(RANGES.DO[g], 2);
+      const tp  = randIn(RANGES.TP[g], 3);
+      const tn  = randIn(RANGES.TN[g], 3);
+      const chla= randIn(RANGES.CHLA[g], 1);
+
+      const toc = randIn(EXTRA.TOC[g], 1);
+      const bod = randIn(EXTRA.BOD[g], 1);
+      const cl  = randIn(EXTRA.CL[g], 1);
+      const cd  = randIn(EXTRA.CD[g], 6);
+      const ec  = randIn(EXTRA.EC[g], 0);
+      const tC  = randIn(EXTRA.TEMP[g], 1);
+
+      return {
+        // grade: g,
+        temp_c: tC,
+        ph: pH,
+        ec_us_cm: ec,
+        do_mg_l: dox,
+        toc_mg_l: toc,
+        cod_mg_l: cod,
+        t_n_mg_l: tn,
+        t_p_mg_l: tp,
+        ss_mg_l: ss,
+        cl_mg_l: cl,
+        chl_a_mg_m3: chla,
+        cd_mg_l: cd,
+        bod_mg_l: bod
+      };
+    }
+
+    // 등급 무작위 선택(좋음~나쁨 전체)
+    function randomWQ(){
+      const g = LAKE_GRADES[Math.floor(Math.random()*LAKE_GRADES.length)];
+      return randomWQByGrade(g);
+    }
+
+    function toggleAuto(){
+      if(autoTimer){
+        clearInterval(autoTimer); autoTimer=null; log('자동 전송 중지');
+      }else{
+        if(!selected){ alert('타일을 먼저 선택하세요'); return; }
+        autoTimer = setInterval(()=>{
+          const sample = randomWQ();
+          send(sample);
+          // send({
+          //  zone_id: selected.zone_id, chla, ph:7.2, do:6.2, turb:2.0
+          // });
+        }, 30000);
+        log('자동 전송 시작 (30초마다)');
+      }
+    }
+
+
+    function appendLLMLog(resp){
+      const html = `
+        <div><b>[AI Roboat 응답]</b></div>
+        zone: <b>${resp.zone_id ?? '-'}</b>, device: ${resp.device_id ?? '-'}
+        현재등급: ${resp.curr_wq_state ?? '-'} → 목표등급: ${resp.target_wq_state ?? '-'}
+        <div style="margin-top:1px;white-space:pre-wrap;">${resp.reason ?? ''}</div>
+        ${
+          Array.isArray(resp.reference_sources) && resp.reference_sources.length
+          ? `<div style="font-size:12px;margin-top:1px;color:#555;">참고문헌:<br/>${resp.reference_sources.map(x=>`• ${x}`).join('<br/>')}</div>`
+          : ''
+        }
+      `;
+      // appendBubble(html, 'bubble-bot');
+      log(html);
+    }
+
+    async function saveWQToDB(zone_id, device_id, w_data, llmResp){
+      const payload = {
+        zone_id,
+        device_id: device_id?.toString(),
+        w_data: {
+          temp_c: w_data.temp_c,
+          ph: w_data.ph,
+          ec_us_cm: w_data.ec_us_cm,
+          do_mg_l: w_data.do_mg_l,
+          toc_mg_l: w_data.toc_mg_l,
+          cod_mg_l: w_data.cod_mg_l,
+          t_n_mg_l: w_data.t_n_mg_l,
+          t_p_mg_l: w_data.t_p_mg_l,
+          ss_mg_l: w_data.ss_mg_l,
+          cl_mg_l: w_data.cl_mg_l,
+          chl_a_mg_m3: w_data.chl_a_mg_m3,
+          cd_mg_l: w_data.cd_mg_l,
+          bod_mg_l: w_data.bod_mg_l
+        },
+        llm: {
+          water_q_idx: llmResp.water_q_idx,
+          zone_id: llmResp.zone_id ?? zone_id,
+          device_id: llmResp.device_id?.toString() ?? device_id?.toString(),
+          curr_wq_state: llmResp.curr_wq_state,
+          target_wq_state: llmResp.target_wq_state,
+          reason: llmResp.reason,
+          reference_sources: llmResp.reference_sources
+        }
+      };
+
+      // console.error(JSON.stringify(payload));
+
+      const r = await fetch('/api/wq/ingest', {
+        method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body: JSON.stringify(payload)
+      });
+      const js = await r.json();
+      // appendBubble(`DB 저장: ${js.ok ? '성공' : '실패'} (idx=${js.idx ?? '-'})`, js.ok ? 'bubble-bot' : 'bubble-user');
+      log(`DB 저장: ${js.ok ? '성공' : '실패'} (idx=${js.idx ?? '-'})`);
+      return js;
+    }
+
+
+  </script>
+  <script async src="https://maps.googleapis.com"></script>
+</body>
+</html>
